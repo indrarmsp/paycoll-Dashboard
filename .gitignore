@@ -1,0 +1,5 @@
+old-codes
+node_modules
+.next
+.env
+.vercel

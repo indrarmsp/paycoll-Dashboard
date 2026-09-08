@@ -1,0 +1,1025 @@
+"use client";
+
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ArrowDownWideNarrow,
+  ArrowUpDown,
+  ArrowUpWideNarrow,
+  Download,
+  Filter,
+  LoaderCircle,
+  Search,
+  X
+} from 'lucide-react';
+import dynamic from 'next/dynamic';
+import {
+  Chart,
+  BarController,
+  BarElement,
+  DoughnutController,
+  ArcElement,
+  CategoryScale,
+  LinearScale,
+  Tooltip,
+  Legend
+} from 'chart.js';
+import type { DashboardStats, FilterOptions, MainDashboardPayload, MainRow } from '../lib/types';
+import {
+  DASHBOARD_AUTO_SYNC_INTERVAL_MS,
+  DASHBOARD_DATA_UPDATED_EVENT,
+  formatCurrency,
+  formatNumber,
+  getWarmMainDashboardPromise,
+  readMainDashboardCache,
+  warmMainDashboardCache,
+  writeMainDashboardCache
+} from '../lib/sheets';
+import { buildExportFilename, downloadXlsx } from '../lib/export-utils';
+import { PaginationControls } from './pagination-controls';
+
+Chart.register(
+  BarController,
+  BarElement,
+  DoughnutController,
+  ArcElement,
+  CategoryScale,
+  LinearScale,
+  Tooltip,
+  Legend
+);
+
+const DetailModal = dynamic(() => import('./detail-modal').then((mod) => mod.DetailModal), {
+  ssr: false
+});
+const ExportModal = dynamic(() => import('./export-modal').then((mod) => mod.ExportModal), {
+  ssr: false
+});
+
+type DashboardClientProps = {
+  initialData?: {
+    rows: MainRow[];
+    filterOptions: FilterOptions;
+    stats: DashboardStats;
+  } | null;
+};
+
+type SortSaldo = 'DEFAULT' | 'LOWEST' | 'HIGHEST';
+
+type FilterKey = 'datel' | 'billCategory' | 'umurCustomer' | 'status';
+
+type DashboardFilters = {
+  datel: string[];
+  billCategory: string[];
+  umurCustomer: string[];
+  status: string[];
+};
+
+type ExportColumn = {
+  key: keyof MainRow | 'paidStatus';
+  label: string;
+  getValue: (row: MainRow) => string | number;
+};
+
+const DEFAULT_FILTERS: DashboardFilters = {
+  datel: [],
+  billCategory: [],
+  umurCustomer: [],
+  status: []
+};
+
+const EXPORT_COLUMNS: ExportColumn[] = [
+  { key: 'snd', label: 'SND', getValue: (row) => row.snd },
+  { key: 'sndGroup', label: 'SND Group', getValue: (row) => row.sndGroup },
+  { key: 'nama', label: 'Name', getValue: (row) => row.nama },
+  { key: 'alamat', label: 'Address', getValue: (row) => row.alamat },
+  { key: 'datel', label: 'Datel', getValue: (row) => row.datel },
+  { key: 'billCategory', label: 'Bill Category', getValue: (row) => row.billCategory },
+  { key: 'saldo', label: 'Saldo', getValue: (row) => row.saldo },
+  { key: 'umurCustomer', label: 'Customer Age', getValue: (row) => row.umurCustomer },
+  { key: 'noHp', label: 'Phone Number', getValue: (row) => row.noHp },
+  { key: 'email', label: 'Email', getValue: (row) => row.email },
+  { key: 'paidStatus', label: 'Status', getValue: (row) => row.paidL11 || 'UNPAID' }
+];
+
+function ChartCard({
+  title,
+  chartType,
+  labels,
+  values,
+  colors,
+  legend,
+  footer
+}: {
+  title: string;
+  chartType: 'bar' | 'doughnut';
+  labels: string[];
+  values: number[];
+  colors: string[];
+  legend: Array<{ label: string; value: string; color: string }>;
+  footer?: string;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    const chartConfig = {
+      type: chartType,
+      data: {
+        labels,
+        datasets: [{
+          data: values,
+          backgroundColor: chartType === 'bar'
+            ? (context: { chart: Chart }) => {
+                const { chart } = context;
+                const { ctx, chartArea } = chart;
+                if (!chartArea) {
+                  return 'rgba(20, 184, 166, 0.95)';
+                }
+
+                const gradient = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+                gradient.addColorStop(0, 'rgba(20, 184, 166, 0.95)');
+                gradient.addColorStop(1, 'rgba(56, 189, 248, 0.55)');
+                return gradient;
+              }
+            : colors,
+          borderColor: chartType === 'bar' ? 'transparent' : '#ffffff',
+          borderWidth: chartType === 'bar' ? 0 : 4,
+          hoverOffset: chartType === 'doughnut' ? 8 : 0,
+          spacing: chartType === 'doughnut' ? 1 : 0,
+          borderRadius: chartType === 'bar' ? 10 : 0,
+          maxBarThickness: chartType === 'bar' ? 46 : undefined,
+          barPercentage: chartType === 'bar' ? 0.7 : undefined,
+          categoryPercentage: chartType === 'bar' ? 0.74 : undefined
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: chartType === 'doughnut' ? '68%' : undefined,
+        rotation: chartType === 'doughnut' ? -90 : undefined,
+        scales: chartType === 'bar' ? {
+          x: {
+            grid: {
+              display: false
+            },
+            border: {
+              display: false
+            },
+            ticks: {
+              color: '#64748b',
+              font: {
+                size: 13,
+                family: 'Inter, sans-serif'
+              }
+            }
+          },
+          y: {
+            beginAtZero: true,
+            grid: {
+              color: '#dbe4f0',
+              drawBorder: false
+            },
+            border: {
+              display: false
+            },
+            ticks: {
+              color: '#64748b',
+              font: {
+                size: 13,
+                family: 'Inter, sans-serif'
+              },
+              callback(value: string | number) {
+                const numericValue = Number(value);
+                if (numericValue === 0) {
+                  return '0K';
+                }
+
+                if (numericValue >= 1_000_000_000) {
+                  return `${(numericValue / 1_000_000_000).toFixed(1)}B`;
+                }
+
+                if (numericValue >= 1_000_000) {
+                  return `${(numericValue / 1_000_000).toFixed(1)}M`;
+                }
+
+                if (numericValue >= 1_000) {
+                  return `${(numericValue / 1_000).toFixed(1)}K`;
+                }
+
+                return `${numericValue}K`;
+              }
+            }
+          }
+        } : undefined,
+        plugins: {
+          legend: {
+            display: false
+          },
+          tooltip: {
+            backgroundColor: '#0f172a',
+            titleColor: '#fff',
+            bodyColor: '#fff',
+            padding: 10,
+            displayColors: true
+          }
+        }
+      }
+    } as any;
+
+    const chart = new Chart(canvas, chartConfig);
+
+    return () => chart.destroy();
+  }, [chartType, colors, labels, values]);
+
+  return (
+    <div className="flex flex-col rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+      <h2 className="mb-4 text-lg font-semibold text-slate-800">{title}</h2>
+      <div className={chartType === 'bar' ? 'flex flex-1 flex-col' : 'flex flex-1 flex-col items-center'}>
+        <div className={chartType === 'bar' ? 'relative h-[320px] w-full' : 'relative mx-auto h-72 w-72'}>
+          <canvas ref={canvasRef} className="h-full w-full" />
+        </div>
+
+        {chartType === 'doughnut' ? (
+          <div className="mt-5 flex flex-wrap items-center justify-center gap-5">
+            {legend.map((item) => (
+              <div key={item.label} className="flex items-center gap-2 text-sm text-slate-600">
+                <span className="h-3.5 w-3.5 rounded-full" style={{ backgroundColor: item.color }} />
+                <span className="font-medium tracking-wide">{item.label.toUpperCase()}</span>
+              </div>
+            ))}
+          </div>
+        ) : footer ? (
+          <div className="mt-4 text-center text-sm font-medium text-slate-600">
+            {footer}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+export function DashboardClient({ initialData }: DashboardClientProps) {
+  const [rows, setRows] = useState<MainRow[]>(initialData?.rows ?? []);
+  const [filterOptions, setFilterOptions] = useState<FilterOptions>(initialData?.filterOptions ?? { datel: [], billCategory: [], umurCustomer: [] });
+  const [stats, setStats] = useState<DashboardStats>(initialData?.stats ?? { categoryStats: {}, paidCount: 0, unpaidCount: 0 });
+  const [loading, setLoading] = useState(!initialData);
+  const [error, setError] = useState('');
+  const [hydrationDone, setHydrationDone] = useState(Boolean(initialData));
+
+  const [searchTerm, setSearchTerm] = useState('');
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(20);
+  const [sortSaldo, setSortSaldo] = useState<SortSaldo>('DEFAULT');
+  const [filters, setFilters] = useState<DashboardFilters>(DEFAULT_FILTERS);
+  const [openPopup, setOpenPopup] = useState<FilterKey | null>(null);
+  const [detailModal, setDetailModal] = useState<{ label: string; value: string } | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportCurrentPageOnly, setExportCurrentPageOnly] = useState(false);
+  const [selectedExportColumns, setSelectedExportColumns] = useState<string[]>(EXPORT_COLUMNS.map((column) => String(column.key)));
+  const hasInitializedFilters = useRef(false);
+
+  function applyPayload(payload: MainDashboardPayload) {
+    setRows(payload.rows || []);
+    setFilterOptions(payload.filterOptions || { datel: [], billCategory: [], umurCustomer: [] });
+    setStats(payload.stats || { categoryStats: {}, paidCount: 0, unpaidCount: 0 });
+  }
+
+  async function refreshDashboardData() {
+    try {
+      const response = await fetch('/api/sheets/main?refresh=1', {
+        cache: 'no-store'
+      });
+      const payload = await response.json() as MainDashboardPayload & { message?: string };
+
+      if (!response.ok || !payload.rows) {
+        return;
+      }
+
+      writeMainDashboardCache(payload);
+      applyPayload(payload);
+      setLoading(false);
+      setHydrationDone(true);
+    } catch {
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadDashboard() {
+      try {
+        const cachedPayload = readMainDashboardCache();
+        if (cachedPayload) {
+          applyPayload(cachedPayload);
+          setLoading(false);
+          setHydrationDone(true);
+          void refreshDashboardData();
+          return;
+        }
+
+        if (initialData) {
+          applyPayload(initialData);
+          setLoading(false);
+          setHydrationDone(true);
+          void refreshDashboardData();
+          return;
+        }
+
+        const warmPromise = getWarmMainDashboardPromise();
+        if (warmPromise) {
+          const warmedPayload = await warmPromise;
+          if (cancelled) {
+            return;
+          }
+
+          if (warmedPayload) {
+            if (!warmedPayload.rows?.length) {
+              setLoading(false);
+              setHydrationDone(true);
+              return;
+            }
+
+            applyPayload(warmedPayload);
+            setLoading(false);
+            setHydrationDone(true);
+            void refreshDashboardData();
+            return;
+          }
+        }
+
+        setLoading(true);
+        const response = await fetch('/api/sheets/main', {
+          cache: 'no-store'
+        });
+        const payload = (await response.json()) as MainDashboardPayload & { message?: string };
+
+        if (!response.ok) {
+          throw new Error(payload.message || 'Failed to load dashboard data');
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        if (payload.rows?.length) {
+          writeMainDashboardCache(payload);
+          applyPayload(payload);
+        }
+        setLoading(false);
+        setHydrationDone(true);
+      } catch (loadError) {
+        if (cancelled) {
+          return;
+        }
+
+        setError(loadError instanceof Error ? loadError.message : 'Failed to load dashboard data');
+        setLoading(false);
+      }
+    }
+
+    loadDashboard();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [initialData]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let syncing = false;
+
+    async function syncDashboardIfVisible() {
+      if (cancelled || syncing || typeof document === 'undefined') {
+        return;
+      }
+
+      if (document.visibilityState !== 'visible') {
+        return;
+      }
+
+      syncing = true;
+      try {
+        await refreshDashboardData();
+      } catch {
+      } finally {
+        syncing = false;
+      }
+    }
+
+    const intervalId = window.setInterval(syncDashboardIfVisible, DASHBOARD_AUTO_SYNC_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleDashboardUpdate() {
+      void refreshDashboardData();
+    }
+
+    function handleStorageUpdate(event: StorageEvent) {
+      if (event.key === 'pcDashboardDataVersion') {
+        void refreshDashboardData();
+      }
+    }
+
+    window.addEventListener(DASHBOARD_DATA_UPDATED_EVENT, handleDashboardUpdate as EventListener);
+    window.addEventListener('storage', handleStorageUpdate);
+
+    return () => {
+      window.removeEventListener(DASHBOARD_DATA_UPDATED_EVENT, handleDashboardUpdate as EventListener);
+      window.removeEventListener('storage', handleStorageUpdate);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (hasInitializedFilters.current) {
+      return;
+    }
+
+    if (
+      filterOptions.datel.length === 0
+      && filterOptions.billCategory.length === 0
+      && filterOptions.umurCustomer.length === 0
+    ) {
+      return;
+    }
+
+    setFilters({
+      datel: [...filterOptions.datel],
+      billCategory: [...filterOptions.billCategory],
+      umurCustomer: [...filterOptions.umurCustomer],
+      status: ['PAID', 'UNPAID']
+    });
+    hasInitializedFilters.current = true;
+  }, [filterOptions]);
+
+  useEffect(() => {
+    function handlePointerDown(event: MouseEvent) {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest('[data-filter-popup], [data-filter-button]')) {
+        setOpenPopup(null);
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, []);
+
+  const filteredRows = useMemo(() => {
+    const term = deferredSearchTerm.trim().toLowerCase();
+    const datelSet = new Set(filters.datel);
+    const categorySet = new Set(filters.billCategory);
+    const umurSet = new Set(filters.umurCustomer);
+    const statusSet = new Set(filters.status);
+
+    const isAllDatel = datelSet.size === filterOptions.datel.length && datelSet.size > 0;
+    const isAllCategory = categorySet.size === filterOptions.billCategory.length && categorySet.size > 0;
+    const isAllUmur = umurSet.size === filterOptions.umurCustomer.length && umurSet.size > 0;
+    const isAllStatus = statusSet.size === 2;
+
+    const nextRows = rows.filter((row) => {
+      if (term && !row._namaLower.includes(term) && !row._sndLower.includes(term)) {
+        return false;
+      }
+      if (!isAllDatel && !datelSet.has(row.datel)) {
+        return false;
+      }
+      if (!isAllCategory && !categorySet.has(row.billCategory)) {
+        return false;
+      }
+      if (!isAllUmur && !umurSet.has(row.umurCustomer)) {
+        return false;
+      }
+      if (!isAllStatus && !statusSet.has(row._paidStatus)) {
+        return false;
+      }
+      return true;
+    });
+
+    if (sortSaldo === 'LOWEST') {
+      nextRows.sort((left, right) => left.saldo - right.saldo);
+    } else if (sortSaldo === 'HIGHEST') {
+      nextRows.sort((left, right) => right.saldo - left.saldo);
+    }
+
+    return nextRows;
+  }, [deferredSearchTerm, filters, filterOptions, rows, sortSaldo]);
+
+  const maxPage = Math.max(1, Math.ceil(filteredRows.length / limit));
+  const currentPage = Math.min(page, maxPage);
+  const startIndex = (currentPage - 1) * limit;
+  const pageRows = filteredRows.slice(startIndex, startIndex + limit);
+
+  useEffect(() => {
+    if (page !== currentPage) {
+      setPage(currentPage);
+    }
+  }, [currentPage, page]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [searchTerm, sortSaldo, filters.datel, filters.billCategory, filters.umurCustomer, filters.status, limit]);
+
+  function toggleFilterValue(key: FilterKey, value: string) {
+    setFilters((current) => {
+      const currentValues = current[key];
+
+      if (currentValues.includes(value)) {
+        return {
+          ...current,
+          [key]: currentValues.filter((item) => item !== value)
+        };
+      }
+
+      return {
+        ...current,
+        [key]: [...currentValues, value]
+      };
+    });
+  }
+
+  function clearFilterValues(key: FilterKey) {
+    setFilters((current) => ({ ...current, [key]: [] }));
+  }
+
+  function getFilterValuesByKey(key: FilterKey) {
+    if (key === 'datel') {
+      return filterOptions.datel;
+    }
+
+    if (key === 'billCategory') {
+      return filterOptions.billCategory;
+    }
+
+    if (key === 'umurCustomer') {
+      return filterOptions.umurCustomer;
+    }
+
+    return ['PAID', 'UNPAID'];
+  }
+
+  function toggleSelectAllFilterValues(key: FilterKey) {
+    const allValues = getFilterValuesByKey(key);
+    setFilters((current) => {
+      const allSelected = allValues.length > 0 && current[key].length === allValues.length;
+
+      return {
+        ...current,
+        [key]: allSelected ? [] : [...allValues]
+      };
+    });
+  }
+
+  function hasActiveFilter(key: FilterKey) {
+    const totalValues = getFilterValuesByKey(key).length;
+    if (totalValues === 0) {
+      return false;
+    }
+
+    return filters[key].length !== totalValues;
+  }
+
+  function cycleSortSaldo() {
+    setSortSaldo((current) => {
+      if (current === 'DEFAULT') {
+        return 'LOWEST';
+      }
+
+      if (current === 'LOWEST') {
+        return 'HIGHEST';
+      }
+
+      return 'DEFAULT';
+    });
+  }
+
+  function openExportModal() {
+    setSelectedExportColumns(EXPORT_COLUMNS.map((column) => String(column.key)));
+    setExportCurrentPageOnly(false);
+    setExportOpen(true);
+  }
+
+  function closeExportModal() {
+    setExportOpen(false);
+  }
+
+  function openDetailModal(label: string, value: string) {
+    const normalized = value.trim();
+    if (!normalized) {
+      return;
+    }
+
+    setDetailModal({ label, value: normalized });
+  }
+
+  function handleDownload() {
+    if (!hydrationDone) {
+      window.alert('Data is still syncing in background. Please wait a moment and try again.');
+      return;
+    }
+
+    const selectedColumns = EXPORT_COLUMNS.filter((column) => selectedExportColumns.includes(String(column.key)));
+
+    if (!selectedColumns.length) {
+      window.alert('Select at least 1 column to export.');
+      return;
+    }
+
+    const rowsForExport = exportCurrentPageOnly ? pageRows : filteredRows;
+
+    if (!rowsForExport.length) {
+      window.alert('No data available to export with the current filters.');
+      return;
+    }
+
+    const exportRows = rowsForExport.map((row) => {
+      const record: Record<string, string | number> = {};
+      selectedColumns.forEach((column) => {
+        record[column.label] = column.getValue(row);
+      });
+      return record;
+    });
+
+    const filename = buildExportFilename('dashboard', currentPage, exportCurrentPageOnly);
+    downloadXlsx({ filename, sheetName: 'Dashboard', data: exportRows });
+    closeExportModal();
+  }
+
+  const totalSaldo = useMemo(
+    () => Object.values(stats.categoryStats).reduce((sum, value) => sum + value, 0),
+    [stats.categoryStats]
+  );
+
+  const categoryEntries = useMemo(
+    () => Object.entries(stats.categoryStats)
+      .sort((left, right) => right[1] - left[1])
+      .map(([label, value], index) => ({
+        label,
+        value,
+        color: ['#14b8a6', '#0ea5e9', '#8b5cf6', '#f97316', '#e11d48', '#22c55e', '#64748b'][index % 7]
+      })),
+    [stats.categoryStats]
+  );
+
+  const statusEntries = [
+    { label: 'Paid', value: stats.paidCount, color: '#14b8a6' },
+    { label: 'Unpaid', value: stats.unpaidCount, color: '#f97316' }
+  ];
+
+  const totalStatus = stats.paidCount + stats.unpaidCount;
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[calc(100vh-12rem)] flex-col items-center justify-center text-center">
+        <LoaderCircle className="mb-4 h-10 w-10 animate-spin text-brand-500" />
+        <p className="font-medium text-slate-700">Please wait a moment</p>
+        <p className="mt-1 text-sm text-slate-500">We are loading your dashboard data.</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-2xl border border-rose-200 bg-white p-8 text-rose-600 shadow-sm">
+        <div className="flex items-center gap-3">
+          <X className="h-5 w-5" />
+          <div>
+            <h2 className="text-lg font-semibold text-rose-700">Dashboard failed to load</h2>
+            <p className="text-sm text-rose-500">{error}</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto max-w-7xl space-y-6">
+      <div className="grid grid-cols-1 gap-6 mb-6 lg:grid-cols-2">
+        <ChartCard
+          title="Total Saldo per Bill Category"
+          chartType="bar"
+          labels={categoryEntries.length ? categoryEntries.map((entry) => entry.label) : ['No data']}
+          values={categoryEntries.length ? categoryEntries.map((entry) => entry.value) : [1]}
+          colors={categoryEntries.length ? categoryEntries.map((entry) => entry.color) : ['#cbd5e1']}
+          legend={[]}
+          footer={`Total saldo: ${formatCurrency(totalSaldo)}`}
+        />
+
+        <ChartCard
+          title="Payment Status"
+          chartType="doughnut"
+          labels={statusEntries.map((entry) => entry.label)}
+          values={statusEntries.map((entry) => entry.value)}
+          colors={statusEntries.map((entry) => entry.color)}
+          legend={statusEntries.map((entry) => ({
+            label: entry.label,
+            value: formatNumber(entry.value),
+            color: entry.color
+          }))}
+        />
+      </div>
+
+      <div className="flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div className="flex flex-col justify-between gap-4 border-b border-slate-100 p-6 md:flex-row md:items-center">
+          <h2 className="text-lg font-semibold text-slate-800">Customer Data</h2>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              id="openExportMainModal"
+              type="button"
+              onClick={openExportModal}
+              className="rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-700"
+            >
+              <Download className="mr-1 inline-block h-4 w-4" />
+              Download XLSX
+            </button>
+
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <input
+                id="searchInput"
+                type="text"
+                value={searchTerm}
+                onChange={(event) => setSearchTerm(event.target.value)}
+                placeholder="Search..."
+                className="w-48 rounded-lg border border-slate-200 py-2 pl-10 pr-4 text-sm transition-all focus:outline-none focus:ring-2 focus:ring-teal-500"
+              />
+            </div>
+
+            <select
+              id="pageSizeSelect"
+              value={limit}
+              onChange={(event) => setLimit(Number(event.target.value))}
+              className="cursor-pointer rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+            >
+              <option value="10">10 / page</option>
+              <option value="20">20 / page</option>
+              <option value="50">50 / page</option>
+              <option value="100">100 / page</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="table-container relative w-full overflow-y-auto overflow-x-hidden">
+          <table className="w-full table-fixed text-left text-sm">
+            <colgroup>
+              <col style={{ width: '12%' }} />
+              <col style={{ width: '13%' }} />
+              <col style={{ width: '12%' }} />
+              <col style={{ width: '12%' }} />
+              <col style={{ width: '12%' }} />
+              <col style={{ width: '10%' }} />
+              <col style={{ width: '10%' }} />
+              <col style={{ width: '11%' }} />
+              <col style={{ width: '8%' }} />
+            </colgroup>
+            <thead className="sticky top-0 z-10 bg-slate-50 font-semibold text-slate-600 shadow-sm">
+              <tr>
+                <th className="px-4 py-4 border-b border-slate-200">SND</th>
+                <th className="px-4 py-4 border-b border-slate-200">SND Group</th>
+                <th className="px-4 py-4 border-b border-slate-200">Name</th>
+                <th className="px-4 py-4 border-b border-slate-200">Address</th>
+                <th className="relative px-4 py-4 border-b border-slate-200">
+                  <div className="flex items-center gap-2">
+                    Datel
+                    <button data-filter-button type="button" onClick={() => setOpenPopup((current) => (current === 'datel' ? null : 'datel'))} className={hasActiveFilter('datel') ? 'text-brand-600' : 'text-slate-400 hover:text-brand-600'}>
+                      <Filter className="h-3 w-3" />
+                    </button>
+                  </div>
+                  {openPopup === 'datel' ? (
+                    <div data-filter-popup className="absolute left-3 top-12 z-20 w-64 rounded-lg border border-slate-200 bg-white p-3 shadow-lg">
+                      <p className="mb-2 text-xs font-semibold text-slate-500">Filter Datel</p>
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <span className="text-xs text-slate-500">
+                          {`${filters.datel.length} selected`}
+                        </span>
+                        <button type="button" onClick={() => toggleSelectAllFilterValues('datel')} className="rounded-md border border-slate-200 px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50">
+                          {filters.datel.length === filterOptions.datel.length && filterOptions.datel.length > 0 ? 'Uncheck All' : 'Select All'}
+                        </button>
+                      </div>
+                      <div className="max-h-52 space-y-1 overflow-y-auto pr-1">
+                        {filterOptions.datel.map((option) => (
+                          <label key={option} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-50">
+                            <input type="checkbox" checked={filters.datel.includes(option)} onChange={() => toggleFilterValue('datel', option)} className="rounded border-slate-300 text-brand-500 focus:ring-brand-500" />
+                            <span className="truncate">{option}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </th>
+                <th className="relative px-4 py-4 border-b border-slate-200">
+                  <div className="flex items-center gap-2">
+                    Category
+                    <button data-filter-button type="button" onClick={() => setOpenPopup((current) => (current === 'billCategory' ? null : 'billCategory'))} className={hasActiveFilter('billCategory') ? 'text-brand-600' : 'text-slate-400 hover:text-brand-600'}>
+                      <Filter className="h-3 w-3" />
+                    </button>
+                  </div>
+                  {openPopup === 'billCategory' ? (
+                    <div data-filter-popup className="absolute left-3 top-12 z-20 w-64 rounded-lg border border-slate-200 bg-white p-3 shadow-lg">
+                      <p className="mb-2 text-xs font-semibold text-slate-500">Filter Bill Category</p>
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <span className="text-xs text-slate-500">
+                          {`${filters.billCategory.length} selected`}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => toggleSelectAllFilterValues('billCategory')}
+                          className="rounded-md border border-slate-200 px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                        >
+                          {filters.billCategory.length === filterOptions.billCategory.length && filterOptions.billCategory.length > 0 ? 'Uncheck All' : 'Select All'}
+                        </button>
+                      </div>
+                      <div className="max-h-52 space-y-1 overflow-y-auto pr-1">
+                        {filterOptions.billCategory.map((option) => (
+                          <label key={option} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-50">
+                            <input
+                              type="checkbox"
+                              checked={filters.billCategory.includes(option)}
+                              onChange={() => toggleFilterValue('billCategory', option)}
+                              className="rounded border-slate-300 text-brand-500 focus:ring-brand-500"
+                            />
+                            <span className="truncate">{option}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </th>
+                <th className="px-4 py-4 border-b border-slate-200">
+                  <div className="flex items-center gap-2">
+                    Balance
+                    <button
+                      id="sortSaldoBtn"
+                      type="button"
+                      onClick={cycleSortSaldo}
+                      title={`Sort Saldo: ${sortSaldo.toLowerCase()}`}
+                      className={sortSaldo === 'DEFAULT' ? 'text-slate-400 hover:text-brand-600' : 'text-brand-600'}
+                    >
+                      {sortSaldo === 'LOWEST' ? <ArrowUpWideNarrow className="h-3 w-3" /> : sortSaldo === 'HIGHEST' ? <ArrowDownWideNarrow className="h-3 w-3" /> : <ArrowUpDown className="h-3 w-3" />}
+                    </button>
+                  </div>
+                </th>
+                <th className="relative px-4 py-4 border-b border-slate-200 text-center whitespace-nowrap">
+                  <div className="inline-flex items-center justify-center gap-2 whitespace-nowrap">
+                    <span>Age</span>
+                    <button data-filter-button type="button" onClick={() => setOpenPopup((current) => (current === 'umurCustomer' ? null : 'umurCustomer'))} className={[hasActiveFilter('umurCustomer') ? 'text-brand-600' : 'text-slate-400 hover:text-brand-600', 'shrink-0'].join(' ')}>
+                      <Filter className="h-3 w-3" />
+                    </button>
+                  </div>
+                  {openPopup === 'umurCustomer' ? (
+                    <div data-filter-popup className="absolute left-1/2 top-12 z-40 w-64 -translate-x-1/2 rounded-lg border border-slate-200 bg-white p-3 text-left shadow-lg">
+                      <p className="mb-2 text-xs font-semibold text-slate-500">Filter Customer Age</p>
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <span className="text-xs text-slate-500">
+                          {`${filters.umurCustomer.length} selected`}
+                        </span>
+                        <button type="button" onClick={() => toggleSelectAllFilterValues('umurCustomer')} className="rounded-md border border-slate-200 px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50">
+                          {filters.umurCustomer.length === filterOptions.umurCustomer.length && filterOptions.umurCustomer.length > 0 ? 'Uncheck All' : 'Select All'}
+                        </button>
+                      </div>
+                      <div className="max-h-52 space-y-1 overflow-y-auto pr-1">
+                        {filterOptions.umurCustomer.map((option) => (
+                          <label key={option} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-50">
+                            <input type="checkbox" checked={filters.umurCustomer.includes(option)} onChange={() => toggleFilterValue('umurCustomer', option)} className="rounded border-slate-300 text-brand-500 focus:ring-brand-500" />
+                            <span className="truncate">{option}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </th>
+                <th className="relative px-4 py-4 border-b border-slate-200 text-center whitespace-nowrap">
+                  <div className="flex items-center justify-center gap-2">
+                    Status
+                    <button data-filter-button type="button" onClick={() => setOpenPopup((current) => (current === 'status' ? null : 'status'))} className={hasActiveFilter('status') ? 'text-brand-600' : 'text-slate-400 hover:text-brand-600'}>
+                      <Filter className="h-3 w-3" />
+                    </button>
+                  </div>
+                  {openPopup === 'status' ? (
+                    <div data-filter-popup className="absolute right-3 top-12 z-20 w-56 rounded-lg border border-slate-200 bg-white p-3 text-left shadow-lg">
+                      <p className="mb-2 text-xs font-semibold text-slate-500">Filter Status</p>
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <span className="text-xs text-slate-500">
+                          {`${filters.status.length} selected`}
+                        </span>
+                        <button type="button" onClick={() => toggleSelectAllFilterValues('status')} className="rounded-md border border-slate-200 px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50">
+                          {filters.status.length === 2 ? 'Uncheck All' : 'Select All'}
+                        </button>
+                      </div>
+                      <div className="space-y-1">
+                        {['PAID', 'UNPAID'].map((option) => (
+                          <label key={option} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-50">
+                            <input type="checkbox" checked={filters.status.includes(option)} onChange={() => toggleFilterValue('status', option)} className="rounded border-slate-300 text-brand-500 focus:ring-brand-500" />
+                            <span className="truncate">{option}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </th>
+              </tr>
+            </thead>
+            <tbody id="tableBody" className="divide-y divide-slate-100 bg-white">
+              {pageRows.map((row, index) => {
+                const isPaid = row.paidL11.toUpperCase() === 'PAID';
+                const badgeStyle = isPaid
+                  ? 'border-emerald-200 bg-emerald-100 text-emerald-700'
+                  : 'border-rose-200 bg-rose-100 text-rose-700';
+
+                return (
+                  <tr key={`${row.snd}-${index}`} className={index % 2 === 0 ? 'bg-white hover:bg-brand-50' : 'bg-slate-50/50 hover:bg-brand-50'}>
+                    <td className="border-b border-slate-100 px-4 py-3 font-medium text-slate-600">{row.snd}</td>
+                    <td className="border-b border-slate-100 px-4 py-3 text-slate-500">
+                      <span className="block w-full truncate text-left">{row.sndGroup || '-'}</span>
+                    </td>
+                    <td className="border-b border-slate-100 px-4 py-3 font-medium text-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => openDetailModal('Name', row.nama || '-')}
+                        className="block w-full truncate text-left hover:text-brand-600"
+                      >
+                        {row.nama || '-'}
+                      </button>
+                    </td>
+                    <td className="border-b border-slate-100 px-4 py-3 text-slate-500">
+                      <button
+                        type="button"
+                        onClick={() => openDetailModal('Address', row.alamat || '-')}
+                        className="block w-full truncate text-left hover:text-brand-600"
+                      >
+                        {row.alamat || '-'}
+                      </button>
+                    </td>
+                    <td className="border-b border-slate-100 px-4 py-3 text-slate-500">
+                      <button
+                        type="button"
+                        onClick={() => openDetailModal('Datel', row.datel || '-')}
+                        className="block w-full truncate text-left hover:text-brand-600"
+                      >
+                        {row.datel || '-'}
+                      </button>
+                    </td>
+                    <td className="border-b border-slate-100 px-4 py-3">
+                      <span className="inline-flex max-w-full items-center rounded-lg border border-slate-200 bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600" title={row.billCategory || 'Unknown'}>
+                        <span className="truncate">{row.billCategory || 'Unknown'}</span>
+                      </span>
+                    </td>
+                    <td className="border-b border-slate-100 px-4 py-3 text-right font-medium text-slate-800">{formatCurrency(row.saldo)}</td>
+                    <td className="border-b border-slate-100 px-4 py-3 text-center text-slate-500 whitespace-nowrap">{row.umurCustomer}</td>
+                    <td className="border-b border-slate-100 px-4 py-3 text-center whitespace-nowrap">
+                      <span className={['rounded-lg border px-2 py-1 text-[11px] font-medium', badgeStyle].join(' ')}>{row.paidL11 || 'UNPAID'}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          {pageRows.length === 0 ? (
+            <div id="emptyState" className="flex flex-col items-center justify-center bg-white py-12 text-center text-slate-500">
+              <Search className="mb-3 h-10 w-10 text-slate-300" />
+              <p>No matching records found.</p>
+            </div>
+          ) : null}
+        </div>
+
+        <PaginationControls
+          currentPage={currentPage}
+          maxPage={maxPage}
+          totalFiltered={filteredRows.length}
+          limit={limit}
+          onPageChange={setPage}
+        />
+      </div>
+
+      {detailModal ? (
+        <DetailModal
+          label={detailModal.label}
+          value={detailModal.value}
+          onClose={() => setDetailModal(null)}
+        />
+      ) : null}
+
+      {exportOpen ? (
+        <ExportModal
+          columns={EXPORT_COLUMNS.map((c) => ({ key: String(c.key), label: c.label }))}
+          selectedColumns={selectedExportColumns}
+          onSelectedColumnsChange={setSelectedExportColumns}
+          exportCurrentPageOnly={exportCurrentPageOnly}
+          onExportCurrentPageOnlyChange={setExportCurrentPageOnly}
+          onDownload={handleDownload}
+          onClose={closeExportModal}
+        />
+      ) : null}
+    </div>
+  );
+}
